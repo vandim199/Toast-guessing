@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>French Toast</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,700;9..144,800&display=swap" rel="stylesheet">
+<style>
+  :root{--navy:#14213D;--panel:#1F3158;--line:#3B4E7C;--toast:#F4B942;--crust:#C98A1B;--sugar:#FFF8EC;--berry:#E5484D}
+  html,body{min-height:100%}
+  body{background:var(--navy);color:var(--sugar);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+       padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom);-webkit-tap-highlight-color:transparent}
+  .font-display{font-family:'Fraunces',Georgia,serif;font-weight:800;letter-spacing:-.01em}
+  .btn{display:block;width:100%;min-height:56px;padding:14px 18px;border-radius:16px;font-weight:700;font-size:1.05rem;
+       border:2px solid transparent;text-align:center;transition:transform .08s}
+  .btn:active{transform:scale(.98)}
+  .btn:disabled{opacity:.35}
+  .btn:focus-visible,input:focus-visible{outline:3px solid var(--sugar);outline-offset:2px}
+  .gold{background:var(--toast);color:var(--navy)}
+  .ghost{border-color:#5A6C98;color:var(--sugar)}
+  .opt{background:var(--panel);border-color:var(--line);color:var(--sugar)}
+  .opt.sel{border-color:var(--toast);background:#2B4272}
+  .slice{background:var(--toast);color:var(--navy);border:4px solid var(--crust);border-radius:3rem 3rem 1rem 1rem;padding:1.25rem 1rem}
+  .card{background:var(--panel);border-radius:16px;padding:14px 16px}
+  .muted{color:#A9B6D6}
+  .tnum{font-variant-numeric:tabular-nums}
+  .expired #tNum{color:var(--berry)}
+  @keyframes flash{0%,100%{background:var(--navy)}20%,60%{background:var(--berry)}40%,80%{background:var(--navy)}}
+  body.flash{animation:flash 1.2s 2}
+  @media (prefers-reduced-motion:reduce){body.flash{animation:none;background:var(--berry)}}
+</style>
+</head>
+<body>
+<main id="app" class="mx-auto w-full max-w-md px-5 py-6"></main>
+
+<script>
+const MAX_ROUNDS = 6, ROUND_SECONDS = 30;
+let DATA = null, AC = null, peekTimer = null;
+
+const S = {
+  lang: 'en', difficulty: 'basic', screen: 'loading',
+  word: '', round: 1, revealed: false, peek: false,
+  hintOptions: [], pickedHint: null, pickedScale: null,
+  hints: [], used: new Set(), ladder: [], editing: false,
+  won: false, winRound: 0,
+  timeLeft: ROUND_SECONDS, running: false, expired: false, endAt: 0, timerId: null
+};
+
+const $app = document.getElementById('app');
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const t = (k, v = {}) => {
+  const s = (DATA?.[S.lang]?.ui?.[k]) || DATA?.en?.ui?.[k] || k;
+  return s.replace(/\{(\w+)\}/g, (_, x) => v[x] ?? '');
+};
+const pool = key => { const l = DATA[S.lang]?.[key]; return l && l.length ? l : DATA.en[key]; };
+const sample = (arr, n) => [...arr].sort(() => Math.random() - .5).slice(0, n);
+const gold = s => `<span style="color:var(--toast)">${esc(s)}</span>`;
+
+/* ---------- data & lifecycle ---------- */
+async function load() {
+  S.screen = 'loading'; render();
+  try {
+    const r = await fetch('data.json', { cache: 'no-store' });
+    DATA = await r.json();
+    try { const l = localStorage.getItem('ft-lang'); if (l && DATA.languages[l]) S.lang = l; } catch (e) {}
+    S.screen = 'setup';
+  } catch (e) { S.screen = 'error'; }
+  render();
+}
+
+function newGame() {
+  const words = pool(S.difficulty === 'advanced' ? 'advancedWords' : 'basicWords');
+  S.word = words[Math.floor(Math.random() * words.length)];
+  Object.assign(S, { round: 1, revealed: false, peek: false, hints: [], used: new Set(),
+    ladder: [t('startWord')], editing: false, won: false, winRound: 0 });
+  S.screen = 'reveal'; render();
+}
+
+function toHints() {
+  stopTimer();
+  const all = pool('hints');
+  const fresh = all.filter(h => !S.used.has(h));
+  S.hintOptions = sample(fresh.length >= 3 ? fresh : all, 3);
+  S.pickedHint = S.pickedScale = null; S.peek = false;
+  S.screen = 'hint'; render();
+}
+
+function beginRound() {
+  S.used.add(S.pickedHint);
+  S.hints.push({ round: S.round, scale: S.pickedScale, hint: S.pickedHint });
+  S.timeLeft = ROUND_SECONDS; S.expired = false; S.editing = false; S.peek = false;
+  S.screen = 'game'; render(); startTimer();
+}
+
+/* ---------- timer ---------- */
+function ensureAudio() {
+  try { AC = AC || new (window.AudioContext || window.webkitAudioContext)(); if (AC.state === 'suspended') AC.resume(); } catch (e) {}
+}
+function beep() {
+  if (!AC) return;
+  [0, .3, .6].forEach((d, i) => {
+    const o = AC.createOscillator(), g = AC.createGain(), at = AC.currentTime + d;
+    o.type = 'square'; o.frequency.value = i === 2 ? 880 : 660;
+    g.gain.setValueAtTime(.2, at); g.gain.exponentialRampToValueAtTime(.001, at + .25);
+    o.connect(g); g.connect(AC.destination); o.start(at); o.stop(at + .26);
+  });
+}
+function startTimer() {
+  if (S.running || S.timeLeft <= 0) return;
+  ensureAudio(); S.running = true; S.endAt = Date.now() + S.timeLeft * 1000;
+  S.timerId = setInterval(tick, 200); updateTimer();
+}
+function stopTimer() { clearInterval(S.timerId); S.running = false; }
+function tick() {
+  S.timeLeft = Math.max(0, Math.ceil((S.endAt - Date.now()) / 1000));
+  if (S.timeLeft <= 0) { stopTimer(); S.expired = true; beep(); navigator.vibrate?.([300, 150, 300, 150, 600]);
+    document.body.classList.add('flash'); setTimeout(() => document.body.classList.remove('flash'), 2500); }
+  updateTimer();
+}
+function resetTimer() { stopTimer(); S.timeLeft = ROUND_SECONDS; S.expired = false; updateTimer(); }
+function updateTimer() {
+  const n = document.getElementById('tNum'); if (!n) return;
+  n.textContent = S.expired ? t('timeUp') : S.timeLeft;
+  n.style.fontSize = S.expired ? '2.75rem' : '';
+  document.getElementById('tBar').style.width = (S.timeLeft / ROUND_SECONDS * 100) + '%';
+  const b = document.getElementById('tBtn');
+  b.textContent = S.running ? t('pause') : t('start'); b.disabled = S.timeLeft <= 0;
+  document.getElementById('tBox').classList.toggle('expired', S.expired);
+}
+
+/* ---------- screens ---------- */
+const seg = (act, items, cur) => `<div class="grid grid-cols-${items.length} gap-2">${items.map(([v, label]) =>
+  `<button class="btn opt ${cur === v ? 'sel' : ''}" data-act="${act}" data-v="${v}">${esc(label)}</button>`).join('')}</div>`;
+
+const peekBlock = () => `
+  <div class="card flex items-center justify-between gap-3">
+    <div class="min-w-0">
+      <div class="muted text-sm">${esc(t('secretWord'))}</div>
+      <div class="font-display text-2xl truncate">${S.peek ? esc(S.word) : '••••••••'}</div>
+    </div>
+    <button class="btn ghost" style="width:auto;min-height:44px;padding:8px 14px" data-act="peek">${esc(S.peek ? t('hideWord') : t('peek'))}</button>
+  </div>`;
+
+const SCREENS = {
+  loading: () => `<p class="muted text-center py-20">${esc(DATA ? t('loading') : 'Loading...')}</p>`,
+  error: () => `<p class="text-center py-20" style="color:var(--berry)">${esc('Could not load data.json. Open the app through a web server (not file://) and keep data.json next to index.html.')}</p>`,
+
+  setup: () => `
+    <div class="pt-8 space-y-7">
+      <div class="text-center space-y-3">
+        <h1 class="font-display text-6xl leading-none">${esc(t('title'))}</h1>
+        <p class="muted">${esc(t('subtitle'))}</p>
+      </div>
+      <div class="space-y-2"><div class="muted text-sm">${esc(t('language'))}</div>
+        ${seg('lang', Object.entries(DATA.languages), S.lang)}</div>
+      <div class="space-y-2"><div class="muted text-sm">${esc(t('difficulty'))}</div>
+        ${seg('diff', [['basic', t('basic')], ['advanced', t('advanced')]], S.difficulty)}</div>
+      <button class="btn gold" data-act="newGame">${esc(t('startGame'))}</button>
+    </div>`,
+
+  reveal: () => `
+    <div class="pt-10 space-y-6 text-center">
+      <p class="font-display text-3xl">${esc(t('passPhone'))}</p>
+      ${S.revealed ? `
+        <div class="slice"><div class="text-sm opacity-70">${esc(t('secretWord'))}</div>
+          <div class="font-display text-5xl break-words py-2">${esc(S.word)}</div></div>
+        <button class="btn gold" data-act="toHints">${esc(t('chooseHint', { n: 1 }))}</button>`
+      : `<button class="btn gold" style="min-height:96px;font-size:1.25rem" data-act="reveal">${esc(t('tapReveal'))}</button>`}
+    </div>`,
+
+  hint: () => `
+    <div class="space-y-5">
+      <h2 class="font-display text-3xl">${esc(t('roundLabel', { n: S.round, max: MAX_ROUNDS }))}</h2>
+      ${peekBlock()}
+      <div class="space-y-2"><div class="muted text-sm">${esc(t('pickHint'))}</div>
+        <div class="grid gap-2">${S.hintOptions.map((h, i) =>
+          `<button class="btn opt ${S.pickedHint === h ? 'sel' : ''}" data-act="pickHint" data-v="${i}">${esc(h)}</button>`).join('')}</div></div>
+      ${S.pickedHint ? `<div class="space-y-2"><div class="muted text-sm">${esc(t('pickScale'))}</div>
+        <div class="grid grid-cols-2 gap-2">${pool('scales').map((s, i) =>
+          `<button class="btn opt ${S.pickedScale === s ? 'sel' : ''}" data-act="pickScale" data-v="${i}" style="font-size:.95rem">${esc(s)}</button>`).join('')}</div></div>` : ''}
+      ${S.pickedHint && S.pickedScale ? `<div class="slice text-center"><div class="text-sm opacity-70">${esc(t('yourClue'))}</div>
+        <div class="font-display text-3xl">${esc(S.pickedScale)} ${esc(S.pickedHint)}</div></div>` : ''}
+      <button class="btn gold" data-act="begin" ${S.pickedHint && S.pickedScale ? '' : 'disabled'}>${esc(t('beginRound'))}</button>
+    </div>`,
+
+  game: () => {
+    const cur = S.ladder[S.ladder.length - 1], prev = S.ladder.slice(0, -1);
+    return `
+    <div class="space-y-4">
+      <div class="flex items-center justify-between"><h2 class="font-display text-2xl">${esc(t('roundLabel', { n: S.round, max: MAX_ROUNDS }))}</h2></div>
+      <div id="tBox" class="card space-y-3">
+        <div class="text-center"><div id="tNum" class="font-display tnum" style="font-size:4.5rem;line-height:1">30</div></div>
+        <div class="h-2 rounded-full" style="background:var(--navy)"><div id="tBar" class="h-2 rounded-full" style="background:var(--toast);width:100%;transition:width .25s linear"></div></div>
+        <div class="grid grid-cols-2 gap-2">
+          <button id="tBtn" class="btn gold" style="min-height:48px" data-act="timer"></button>
+          <button class="btn ghost" style="min-height:48px" data-act="resetTimer">${esc(t('reset'))}</button>
+        </div>
+      </div>
+      ${peekBlock()}
+      <div class="slice text-center space-y-2">
+        <div class="text-sm opacity-70">${esc(t('closestWord'))}</div>
+        <div class="font-display text-4xl break-words">${esc(cur)}</div>
+        ${prev.length ? `<div class="text-sm opacity-70 break-words">${esc(t('earlier'))}: ${esc(prev.slice().reverse().join(' ← '))}</div>` : ''}
+      </div>
+      ${S.editing ? `
+        <form id="wordForm" class="card space-y-3">
+          <input id="wordInput" class="w-full rounded-xl px-4 text-lg" style="min-height:52px;background:var(--navy);border:2px solid var(--line);color:var(--sugar)"
+            placeholder="${esc(t('wordPlaceholder'))}" autocomplete="off" maxlength="40">
+          <div class="grid grid-cols-2 gap-2">
+            <button type="submit" class="btn gold" style="min-height:48px">${esc(t('save'))}</button>
+            <button type="button" class="btn ghost" style="min-height:48px" data-act="cancelEdit">${esc(t('cancel'))}</button>
+          </div>
+        </form>` : `<button class="btn opt" data-act="edit">${esc(t('updateWord'))}</button>`}
+      <div class="card space-y-1">
+        <div class="muted text-sm">${esc(t('hintsLog'))}</div>
+        ${S.hints.map(h => `<div class="text-lg"><span class="muted">${esc(t('roundShort', { n: h.round }))}:</span> <b>${esc(h.scale)}</b> ${esc(h.hint)}</div>`).join('')}
+      </div>
+      <div class="space-y-2 pb-4">
+        <button class="btn gold" data-act="win">${esc(t('guessedCorrectly'))}</button>
+        <button class="btn ghost" data-act="next">${esc(S.round >= MAX_ROUNDS ? t('lastRound') : t('nextRound'))}</button>
+      </div>
+    </div>`;
+  },
+
+  end: () => `
+    <div class="pt-6 space-y-6 text-center">
+      <h2 class="font-display text-5xl" style="color:${S.won ? 'var(--toast)' : 'var(--berry)'}">${esc(S.won ? t('victory') : t('defeat'))}</h2>
+      <div class="slice"><p class="font-display text-2xl leading-snug">${S.won
+        ? t('youGuessed', { word: esc(S.word), n: S.winRound })
+        : t('outOfTime', { word: esc(S.word) })}</p></div>
+      <div class="card text-left space-y-2">
+        <div class="muted text-sm">${esc(t('ladder'))}</div>
+        <ol class="space-y-1">${S.ladder.map((w, i) => `
+          <li class="text-lg ${i === S.ladder.length - 1 ? 'font-bold' : 'muted'}" style="${i === S.ladder.length - 1 ? 'color:var(--toast)' : ''}">
+            ${i ? '↓ ' : ''}${esc(w)}</li>`).join('')}</ol>
+      </div>
+      <button class="btn gold" data-act="again">${esc(t('playAgain'))}</button>
+    </div>`
+};
+
+function render() {
+  $app.innerHTML = SCREENS[S.screen]();
+  if (S.screen === 'game') {
+    updateTimer();
+    if (S.editing) document.getElementById('wordInput')?.focus();
+  }
+}
+
+/* ---------- events ---------- */
+$app.addEventListener('click', e => {
+  const el = e.target.closest('[data-act]'); if (!el) return;
+  const v = el.dataset.v;
+  switch (el.dataset.act) {
+    case 'lang': S.lang = v; try { localStorage.setItem('ft-lang', v); } catch (_) {} render(); break;
+    case 'diff': S.difficulty = v; render(); break;
+    case 'newGame': newGame(); break;
+    case 'reveal': S.revealed = true; render(); break;
+    case 'toHints': toHints(); break;
+    case 'pickHint': S.pickedHint = S.hintOptions[+v]; render(); break;
+    case 'pickScale': S.pickedScale = pool('scales')[+v]; render(); break;
+    case 'begin': beginRound(); break;
+    case 'timer': S.running ? stopTimer() : startTimer(); updateTimer(); break;
+    case 'resetTimer': resetTimer(); break;
+    case 'peek':
+      S.peek = !S.peek; clearTimeout(peekTimer);
+      if (S.peek) peekTimer = setTimeout(() => { S.peek = false; if (['game', 'hint'].includes(S.screen)) render(); }, 4000);
+      render(); break;
+    case 'edit': S.editing = true; render(); break;
+    case 'cancelEdit': S.editing = false; render(); break;
+    case 'win': stopTimer(); S.won = true; S.winRound = S.round; S.screen = 'end'; render(); break;
+    case 'next':
+      stopTimer();
+      if (S.round >= MAX_ROUNDS) { S.won = false; S.screen = 'end'; render(); }
+      else { S.round++; toHints(); }
+      break;
+    case 'again': stopTimer(); load(); break;
+  }
+});
+
+$app.addEventListener('submit', e => {
+  e.preventDefault();
+  const w = document.getElementById('wordInput').value.trim();
+  if (w && w.toLowerCase() !== S.ladder[S.ladder.length - 1].toLowerCase()) S.ladder.push(w);
+  S.editing = false; render();
+});
+
+load();
+</script>
+</body>
+</html>
